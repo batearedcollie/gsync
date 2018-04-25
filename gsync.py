@@ -33,6 +33,7 @@ import sys
 import os
 import sqlite3
 import subprocess
+import re
 
 run_methods=[
     ('add','adds a folder file id pair'),
@@ -155,6 +156,122 @@ def open_database():
         
     return db
 
+def get_info(gid):
+    '''
+    Get the google ID file info
+    '''
+    cmnd = "gdrive info "+gid    
+    proc= subprocess.Popen(cmnd,stdout=subprocess.PIPE, stderr=subprocess.PIPE,shell=True)
+ 
+    info={}
+    for line in proc.stdout: 
+        kk,dta = line.replace("\n","").split(":",1)
+        info[kk]=dta.lstrip(' ')
+    
+    return info   
+
+def check_googleID_exists_and_is_directory(gid):
+    '''
+    Function to check a google ID exists and is a directory
+    '''
+    
+    info=get_info(gid)
+    
+    if info["Mime"] != "application/vnd.google-apps.folder": 
+        print "\nRequested sync google ID is not a directory, check the info and view URL"
+        for kk in info: print "\t",kk," : ",info[kk]
+        return False
+    
+    return True
+
+def list_folder(gid):
+    '''
+    Lists files in a directory, note this only provides a list of immediate children
+    '''
+    cmnd = "gdrive list -q \"'"+gid+"' in parents\" --no-header --name-width 0 -m 9999 --order 'modifiedTime desc'"
+    proc= subprocess.Popen(cmnd,stdout=subprocess.PIPE, stderr=subprocess.PIPE,shell=True)
+    list = {"gid":[],"name":[],"type":[],"size":[],"date-created":[]}
+    for line in proc.stdout: 
+        line=line.replace("\n","")
+        arr = line.split()
+        list["gid"].append(arr[0])
+        list["name"].append(arr[1])
+        list["type"].append(arr[2])
+        if len(arr)==5: 
+            list["size"].append(None)
+            dt =  arr[3]+" "+arr[4]     
+        else:
+            list["size"].append(arr[3])
+            dt =  arr[4]+" "+arr[5]  
+        list["date-created"].append(dt)
+        
+    return list
+
+def make_new_directory(parent_gid,name):
+    '''
+    Make a new directory and return the ID
+    '''
+    
+    print "\nMaking new directory"
+    cmnd = "gdrive mkdir -p "+parent_gid+" "+name
+    subprocess.check_call(cmnd,shell=True)
+    
+    list = list_folder(parent_gid)
+    
+    for gid,nn in zip(list["gid"],list["name"]):
+        if nn == name: return gid
+    sys.exit("Tried to create directory '"+name+"' in "+parent_gid+" but could not get the resulting file ID")
+      
+def empty_folder_check(gid,folder):
+    '''
+    gdrive requires that the first sync action is to upload to an empty folder
+    '''
+    
+    # check folder is empty
+    flist=list_folder(gid)
+    if len(flist)!=0:
+        info = get_info(gid)
+
+        print "\nThe sync folder "+gid+" is not empty going to make a new folder and set the sync process to work with that"        
+        print "Folder info:"
+        for kk in info: print "\t",kk," : ",info[kk]
+    
+        ## Make a temp directory in the parent 
+        new_gid = make_new_directory(info["Parents"],info["Name"]+"-gsync")
+        new_info = get_info(new_gid)
+        
+        ## Run an upload sync
+        print "\nCreated new folder ",info["Name"]+"-gsync"," : ",new_gid,"  running first upload sync"
+        cmnd = "gdrive sync upload "+folder+" "+new_gid
+        subprocess.check_call(cmnd,shell=True)
+        
+        ## Download the files into the new folder (removing from old location)
+        print "\nDownloading files form the old folder"
+        cmnd = "gdrive download "+gid+" --recursive --path "+folder.rstrip('/')
+        print "cmnd: ",cmnd
+        subprocess.check_call(cmnd,shell=True) 
+    
+        #Correct the locations
+        cmnd = "mv -i "+folder+"/"+info["Name"]+"/* "+folder+"/ ; rm -r "+folder+"/"+info["Name"]
+        print "cmnd: ",cmnd
+        subprocess.check_call(cmnd,shell=True) 
+
+        ## Sync upload again
+        print "\nRunning sync upload again."
+        cmnd = "gdrive sync upload "+folder+" "+new_gid
+        print "cmnd: ",cmnd
+        subprocess.check_call(cmnd,shell=True)                
+                
+        print "\nThe local directory "+folder+" has now been synced with drive folder :",new_gid,\
+                " and the contents for the old folder:"
+        print "\t ",info["Name"]," at ",info["ViewUrl"]
+        print "have been copied to  the new location: "
+        print "\t ",new_info["Name"]," at ",new_info["ViewUrl"]        
+
+        return new_gid
+    
+    return gid 
+ 
 def run_add(args):
     '''
     Runs the add 
@@ -172,7 +289,12 @@ def run_add(args):
     folder = os.path.abspath(args[0])
     googleID = args[1]
     
-    # Check google ID exists ?? 
+    # Check google ID exists  and is a diretcory 
+    if check_googleID_exists_and_is_directory(googleID)!=True:
+        sys.exit("Trying to add sync folder "+googleID+" but this id does not exist or is not a directory")
+    
+    # Check is empty 
+    sync_id=empty_folder_check(googleID,folder)
     
     # Open the database
     db = open_database()
@@ -181,7 +303,7 @@ def run_add(args):
     cursor = db.cursor()
     
     cursor.execute('''INSERT INTO sync_list(folder, google_id)
-                  VALUES(?,?)''', (folder,googleID))    
+                  VALUES(?,?)''', (folder,sync_id))    
     db.commit()
 
     db.close()
@@ -216,7 +338,7 @@ def run_delete_id(id):
     Deletes and Id from the database
     ''' 
     db = open_database()
-    cursor = db.cursor()
+    cursor = db.cursor()    
     cursor.execute("delete from sync_list where id=?",(id,))
     db.commit()
     db.close()
